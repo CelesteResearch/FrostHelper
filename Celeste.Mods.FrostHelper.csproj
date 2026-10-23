@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <AssemblyName>Celeste.Mods.FrostHelper</AssemblyName>
+        <RootNamespace>Celeste.Mods.FrostHelper</RootNamespace>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <Nullable>annotations</Nullable>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="MonoMod.RuntimeDetour" Version="25.3.6" />
+        <PackageReference Include="System.Text.Json" Version="8.0.5" />
+        <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="6.1.2" Aliases="RuntimeUnsafe" />
+        <ProjectReference
+            Include="$(SharedRoot)/src/Celeste.Game.Runtime/Celeste.Game.Runtime.csproj"
+            Private="false"
+        />
+        <Reference Include="YamlDotNet" HintPath="$(SharedRoot)/lib/Everest/YamlDotNet.dll" Private="false" />
+    </ItemGroup>
+</Project>

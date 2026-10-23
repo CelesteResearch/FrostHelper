@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.dll binary
+*.snk binary
+
+# Preserve multiline literal values.
+Runtime/Expressions/Commands/Instances/InstanceFunctionCommands.cs -text
+Runtime/Expressions/Descriptors/TypeDescriptor.cs -text
+Runtime/Expressions/Syntax/ExpressionParser.cs -text

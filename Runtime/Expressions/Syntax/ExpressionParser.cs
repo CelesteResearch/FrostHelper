@@ -1,0 +1,447 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Globalization;
+using System.Diagnostics.CodeAnalysis;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Runtime.CompilerServices;
+
+namespace Celeste.Mods.FrostHelper.Runtime.Expressions.Syntax
+{
+    internal partial class ExpressionParser
+    {
+        internal ExpressionParser(IAbstractExpressionErrorLogger logger)
+        {
+            this.logger = logger;
+        }
+
+        private readonly IAbstractExpressionErrorLogger logger;
+
+        // ':' is not banned due to some vanilla flags using it - ternary operations will need something else
+        // ';', '~' is banned and used as a list separator in places accepting expressions, do not unban.
+        private static readonly Regex ReservedCharacters = new Regex(@"[\~\^\[\]\{\};\?]",
+            RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+        internal static readonly JsonSerializerOptions JsonOptions = new()
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        };
+
+        private readonly Dictionary<string, AbstractExpression?> Cache = [];
+
+        public bool TryParseCached(string str, [NotNullWhen(true)] out AbstractExpression? expression)
+        {
+            var exists = Cache.TryGetValue(str, out var cacheRef);
+            if (!exists) Cache.Add(str, null);
+
+            if (!exists)
+            {
+                if (ReservedCharacters.IsMatch(str))
+                {
+                    logger.Error(
+                        $$"""
+                          Expression '{{str}}' contains reserved characters.
+                          If this is an existing map, report this to JaThePlayer,
+                          or else the map might break in the future!
+                          If you're making this map, please choose a different flag/session counter name!
+                          Reserved chars: ^?;~[]{}
+                          """);
+                }
+
+                if (ExpressionToken.Tokenize(str.AsSpan(), logger, out var tokens)
+                    is not ExpressionToken.TokenizerState.End)
+                {
+                    logger.Error($"Failed to tokenize Session Expression:\n{str}");
+                    cacheRef = new LiteralExpression<int>(0);
+                    Cache[str] = cacheRef;
+                    expression = cacheRef;
+                    return false;
+                }
+
+
+                var ret = Parse(tokens.ToArray(), out expression);
+                cacheRef = expression;
+                Cache[str] = cacheRef;
+                return ret;
+            }
+
+            expression = cacheRef;
+            return expression is { };
+        }
+
+        internal bool Parse(ReadOnlySpan<ExpressionToken> tokens,
+            [NotNullWhen(true)] out AbstractExpression? expression)
+        {
+            expression = null;
+
+            if (tokens.Length == 0)
+                return false;
+
+            if (tokens is [var only])
+            {
+                if (only is { Kind: ExpressionToken.Kinds.Bracket, Operand: BracketOperand bracketTokens })
+                {
+                    return Parse(bracketTokens.Tokens.ToArray(), out expression);
+                }
+
+                if (only is { Kind: ExpressionToken.Kinds.InterpolatedString, Operand: List<InterpolationHole> holes })
+                {
+                    var args = new List<AbstractExpression>(holes.Count);
+                    foreach (var innerTokens in holes)
+                    {
+                        if (!Parse(innerTokens.Tokens.ToArray(), out var innerExpr))
+                            return false;
+                        args.Add(innerExpr);
+                    }
+
+                    expression = new InterpolatedStringExpression(args);
+                    return true;
+                }
+
+                if (only is { Kind: ExpressionToken.Kinds.Command, Operand: CommandTokenOperand commandOperand })
+                {
+                    if (commandOperand.Arguments is null)
+                    {
+                        expression = new SimpleCommandExpression(commandOperand.Name);
+                        return true;
+                    }
+
+                    if (commandOperand.Arguments is [{ Tokens: [] }])
+                    {
+                        expression = new FunctionCommandExpression(commandOperand.Name, []);
+                        return true;
+                    }
+
+                    var args = new List<AbstractExpression>(commandOperand.Arguments.Count);
+                    foreach (var innerTokens in commandOperand.Arguments)
+                    {
+                        if (!Parse(innerTokens.Tokens.ToArray(), out var innerExpr))
+                            return false;
+                        args.Add(innerExpr);
+                    }
+
+                    expression = new FunctionCommandExpression(commandOperand.Name, args);
+                    return true;
+                }
+
+                if (only is
+                    {
+                        Kind: ExpressionToken.Kinds.FieldAccess, Operand: FieldAccessTokenOperand fieldAccessOperand
+                    })
+                {
+                    if (!Parse(fieldAccessOperand.ObjectTokens.ToArray(), out expression))
+                    {
+                        return false;
+                    }
+
+                    List<AbstractExpression>? arguments = null;
+                    if (fieldAccessOperand.Arguments is [{ Tokens: [] }])
+                    {
+                        arguments = [];
+                    }
+                    else if (fieldAccessOperand.Arguments is { })
+                    {
+                        arguments = [];
+                        foreach (var argumentTokens in fieldAccessOperand.Arguments)
+                        {
+                            if (!Parse(argumentTokens.Tokens.ToArray(), out var argument))
+                            {
+                                return false;
+                            }
+
+                            arguments.Add(argument);
+                        }
+                    }
+
+                    expression = new FieldAccessExpression(fieldAccessOperand.Name, expression, arguments);
+                    return true;
+                }
+
+                expression = CreateExpressionFromSimpleToken(only);
+
+                if (expression is null)
+                {
+                    logger.Error($"Invalid expression: {string.Join(" ", tokens.ToArray().ToList())}");
+                    return false;
+                }
+
+                return true;
+            }
+
+            if (tokens is [{ IsUnaryOnStrings: true } stringUnary, var stringUnaryArg])
+            {
+                // simplify expressions like `#"strLit"` into just `#stringLit`
+                if (stringUnaryArg is { Kind: ExpressionToken.Kinds.LitString, Operand: string op })
+                    return Parse([new ExpressionToken(stringUnary.Kind, stringUnary.Trivia) { Operand = op }],
+                        out expression);
+
+                if (stringUnaryArg is { Kind: ExpressionToken.Kinds.InterpolatedString })
+                {
+                    if (!Parse([stringUnaryArg], out var unaryStringInterpol))
+                        return false;
+
+                    expression = CreateExpressionFromSimpleToken(stringUnary)!;
+                    switch (expression)
+                    {
+                        case GetSessionVariableExpression sessionVariableExpression:
+                            sessionVariableExpression.Name = unaryStringInterpol;
+                            break;
+                    }
+
+                    return true;
+                }
+            }
+
+            AbstractExpression? left = null;
+            AbstractExpression? right = null;
+
+            // Search for lambdas
+            if (tokens is
+                [
+                    { Kind: ExpressionToken.Kinds.Command, Operand: CommandTokenOperand lambdaArgs },
+                    { Kind: ExpressionToken.Kinds.LambdaArrow },
+                    .. var lambdaCode
+                ])
+            {
+                IList<string> argumentNames;
+                if (lambdaArgs.Arguments is null or [])
+                {
+                    argumentNames = [lambdaArgs.Name];
+                }
+                else if (lambdaArgs.Arguments is [{ Tokens: [] }])
+                {
+                    // $() => ...
+                    argumentNames = [];
+                }
+                else
+                {
+                    argumentNames = [];
+                    foreach (var argumentTokens in lambdaArgs.Arguments)
+                    {
+                        if (argumentTokens.Tokens is not [var onlyToken])
+                        {
+                            logger.Error("Lambda argument names must be a single token.");
+                            return false;
+                        }
+
+                        if (onlyToken.Kind != ExpressionToken.Kinds.Flag)
+                        {
+                            logger.Error(
+                                "Lambda argument names inside a $() must be a simple name, eg. $(a, b) => code");
+                            return false;
+                        }
+
+                        argumentNames.Add(onlyToken.Operand?.ToString() ?? "");
+                    }
+                }
+
+                if (lambdaCode is [])
+                {
+                    logger.Error("Lambda must have code after =>.");
+                    return false;
+                }
+
+                if (!Parse(lambdaCode, out right))
+                    return false;
+
+                expression = new LambdaExpression(argumentNames, right);
+                return true;
+            }
+
+            // Search for && and ||
+            if (FindAny(tokens, out var preBin, out var postBin, out var kind,
+                    (int)ExpressionToken.Kinds.And, (int)ExpressionToken.Kinds.Or))
+            {
+                return HandleBinOp(preBin, postBin, out expression);
+            }
+
+            //< > != == <= >=
+            if (FindAny(tokens, out preBin, out postBin, out kind,
+                    (int)ExpressionToken.Kinds.Eq, (int)ExpressionToken.Kinds.Ne,
+                    (int)ExpressionToken.Kinds.Le, (int)ExpressionToken.Kinds.Lt,
+                    (int)ExpressionToken.Kinds.Ge, (int)ExpressionToken.Kinds.Gt))
+            {
+                return HandleBinOp(preBin, postBin, out expression);
+            }
+
+            // | &
+            if (FindAny(tokens, out preBin, out postBin, out kind,
+                    (int)ExpressionToken.Kinds.BitwiseAnd, (int)ExpressionToken.Kinds.BitwiseOr))
+            {
+                return HandleBinOp(preBin, postBin, out expression);
+            }
+
+            // unary -
+            if (FindAny(tokens, out preBin, out postBin, out kind,
+                    (int)ExpressionToken.Kinds.UnaryMinus))
+            {
+                if (preBin.IsEmpty)
+                {
+                    // unary ops
+                    if (!Parse(postBin, out right))
+                        return false;
+
+#pragma warning disable CS8509 // Preserve the original non-exhaustive switch and its exception behavior.
+                    expression = new BinOpExpression(new LiteralExpression<int>(0), right, kind switch
+                    {
+                        ExpressionToken.Kinds.UnaryMinus => BinOpExpression.Operators.Sub,
+                    });
+#pragma warning restore CS8509
+
+                    return true;
+                }
+            }
+
+            // +-
+            if (FindAnyRight(tokens, out preBin, out postBin, out kind,
+                    (int)ExpressionToken.Kinds.Add, (int)ExpressionToken.Kinds.Sub))
+            {
+                return HandleBinOp(preBin, postBin, out expression);
+            }
+
+            // * / % //
+            if (FindAnyRight(tokens, out preBin, out postBin, out kind,
+                    (int)ExpressionToken.Kinds.Mul, (int)ExpressionToken.Kinds.Div, (int)ExpressionToken.Kinds.DivFloat,
+                    (int)ExpressionToken.Kinds.Modulo))
+            {
+                return HandleBinOp(preBin, postBin, out expression);
+            }
+
+            if (tokens is [{ Kind: ExpressionToken.Kinds.Invert }, .. var toInvert])
+            {
+                if (!Parse(toInvert, out var invertedExpr))
+                    return false;
+
+                expression = new InvertExpression(invertedExpr);
+                return true;
+            }
+
+            logger.Error("Failed to parse Session Expression: invalid syntax");
+            return false;
+
+            bool HandleBinOp(ReadOnlySpan<ExpressionToken> preBin, ReadOnlySpan<ExpressionToken> postBin,
+                [NotNullWhen(true)] out AbstractExpression? expression)
+            {
+                expression = null;
+
+                if (preBin.IsEmpty)
+                {
+                    logger.Error("Binary operator without left-hand side.");
+                    return false;
+                }
+
+                if (postBin.IsEmpty)
+                {
+                    logger.Error("Binary operator without right-hand side.");
+                    return false;
+                }
+
+                if (!Parse(preBin, out left))
+                    return false;
+                if (!Parse(postBin, out right))
+                    return false;
+
+#pragma warning disable CS8509 // Preserve the original non-exhaustive switch and its exception behavior.
+                expression = new BinOpExpression(left, right, kind switch
+                {
+                    ExpressionToken.Kinds.And => BinOpExpression.Operators.And,
+                    ExpressionToken.Kinds.Or => BinOpExpression.Operators.Or,
+                    ExpressionToken.Kinds.Add => BinOpExpression.Operators.Add,
+                    ExpressionToken.Kinds.Sub => BinOpExpression.Operators.Sub,
+                    ExpressionToken.Kinds.Mul => BinOpExpression.Operators.Mul,
+                    ExpressionToken.Kinds.Div => BinOpExpression.Operators.Div,
+                    ExpressionToken.Kinds.DivFloat => BinOpExpression.Operators.DivFloat,
+                    ExpressionToken.Kinds.Modulo => BinOpExpression.Operators.Modulo,
+                    ExpressionToken.Kinds.Eq => BinOpExpression.Operators.Eq,
+                    ExpressionToken.Kinds.Ne => BinOpExpression.Operators.Ne,
+                    ExpressionToken.Kinds.Gt => BinOpExpression.Operators.Gt,
+                    ExpressionToken.Kinds.Ge => BinOpExpression.Operators.Ge,
+                    ExpressionToken.Kinds.Lt => BinOpExpression.Operators.Lt,
+                    ExpressionToken.Kinds.Le => BinOpExpression.Operators.Le,
+                    ExpressionToken.Kinds.BitwiseAnd => BinOpExpression.Operators.BitwiseAnd,
+                    ExpressionToken.Kinds.BitwiseOr => BinOpExpression.Operators.BitwiseOr,
+                });
+#pragma warning restore CS8509
+                return true;
+            }
+
+            bool FindAny(ReadOnlySpan<ExpressionToken> tokens, out ReadOnlySpan<ExpressionToken> left,
+                out ReadOnlySpan<ExpressionToken> right, out ExpressionToken.Kinds kind,
+                params int[] kinds)
+            {
+                for (int i = 0; i < tokens.Length; i++)
+                {
+                    var token = tokens[i];
+                    if (Array.IndexOf(kinds, (int)token.Kind) >= 0)
+                    {
+                        left = tokens[..i];
+                        right = tokens[(i + 1)..];
+                        kind = token.Kind;
+                        return true;
+                    }
+                }
+
+                left = default;
+                right = default;
+                kind = default;
+                return false;
+            }
+
+            bool FindAnyRight(ReadOnlySpan<ExpressionToken> tokens, out ReadOnlySpan<ExpressionToken> left,
+                out ReadOnlySpan<ExpressionToken> right, out ExpressionToken.Kinds kind,
+                params int[] kinds)
+            {
+                for (int i = tokens.Length - 1; i >= 0; i--)
+                {
+                    var token = tokens[i];
+                    if (Array.IndexOf(kinds, (int)token.Kind) >= 0)
+                    {
+                        left = tokens[..i];
+                        right = tokens[(i + 1)..];
+                        kind = token.Kind;
+                        return true;
+                    }
+                }
+
+                left = default;
+                right = default;
+                kind = default;
+                return false;
+            }
+        }
+
+        private static AbstractExpression? CreateExpressionFromSimpleToken(ExpressionToken only)
+        {
+            return only.Kind switch
+            {
+                ExpressionToken.Kinds.Add => null,
+                ExpressionToken.Kinds.Sub => null,
+                ExpressionToken.Kinds.Mul => null,
+                ExpressionToken.Kinds.Div => null,
+                ExpressionToken.Kinds.DivFloat => null,
+                ExpressionToken.Kinds.Flag =>
+                    new GetSessionVariableExpression(new LiteralExpression<string>(only.Operand?.ToString() ?? ""),
+                        GetSessionVariableExpression.Types.Flag),
+                ExpressionToken.Kinds.Counter =>
+                    new GetSessionVariableExpression(new LiteralExpression<string>(only.Operand?.ToString() ?? ""),
+                        GetSessionVariableExpression.Types.Counter),
+                ExpressionToken.Kinds.Slider =>
+                    new GetSessionVariableExpression(new LiteralExpression<string>(only.Operand?.ToString() ?? ""),
+                        GetSessionVariableExpression.Types.Slider),
+                ExpressionToken.Kinds.LitString => new LiteralExpression<string>(only.Operand?.ToString() ?? ""),
+                ExpressionToken.Kinds.LitInt => new LiteralExpression<int>(((LiteralOperand<int>)only.Operand!).Value),
+                ExpressionToken.Kinds.LitFloat => new LiteralExpression<float>(((LiteralOperand<float>)only.Operand!)
+                    .Value),
+                ExpressionToken.Kinds.InterpolatedString => null,
+                ExpressionToken.Kinds.And => null,
+                ExpressionToken.Kinds.Or => null,
+                ExpressionToken.Kinds.Bracket => null,
+                _ => throw new ArgumentOutOfRangeException()
+            };
+        }
+    }
+}
